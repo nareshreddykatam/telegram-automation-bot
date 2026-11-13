@@ -55,7 +55,7 @@ app/
   middlewares/               Dependency injection + admin guard
   filters/database.py        Dynamic source/moderation filters
   utils/                     Link detection, time helpers, errors
-tests/                       46 automated tests (queue, recovery, duplicates, ...)
+tests/                       79 automated tests + 26 optional PostgreSQL integration tests
 ```
 
 The handler layer never contains SQL. Services coordinate repositories and
@@ -122,8 +122,25 @@ On Windows PowerShell, if `python` is not recognized inside the venv, use:
 .\.venv\Scripts\python.exe -m app
 ```
 
-The process is a long-running worker. It uses long polling and must stay alive.
-Do **not** deploy it as a Vercel/serverless function.
+`python -m app` is the local/SQLite runtime. It is a long-running worker: it uses
+long polling, starts APScheduler, and must stay alive.
+
+For PostgreSQL production, the runtime is split across two processes:
+
+| Component | Entrypoint | Role |
+| --- | --- | --- |
+| Vercel serverless webhook | `api/telegram.py` | Validates updates, handles commands, enqueues work. Never publishes inline. |
+| GitHub Actions worker | `python -m app.worker` | One bounded publishing pass per invocation. |
+
+Never deploy `app/main.py` (polling plus APScheduler) to a serverless platform.
+The deployment runbooks live in `deployment/`:
+
+- `deployment/PHASE3_READINESS.md` — readiness, risks, cost, end-to-end test plan
+- `deployment/SUPABASE_SETUP.md` — migrations, pooler DSN, roles, backups
+- `deployment/VERCEL_SETUP.md` — webhook project and environment variables
+- `deployment/GITHUB_ACTIONS_SETUP.md` — worker activation and limits
+- `deployment/TELEGRAM_WEBHOOK_SETUP.md` — registration and verification
+- `deployment/ROLLBACK.md` — emergency shutdown and rollback
 
 ## BotFather and administrator permissions
 
@@ -340,26 +357,127 @@ WantedBy=multi-user.target
 
 Use a persistent volume/directory for `DATABASE_PATH` and `LOG_FILE`.
 
-## PostgreSQL migration path
+## Database backends
 
-SQLite is the only backend implemented and tested in this version. The code is
-structured for a contained migration:
+SQLite is the default and remains the local-development and rollback backend.
+PostgreSQL is opt-in:
 
-- All SQL is in `app/db/repositories/`; handlers/services are backend-agnostic.
-- `app/db/database.py` is the only connection/transaction implementation.
-- Migrations are numbered in `app/db/schema.py`.
+```dotenv
+DATABASE_BACKEND=postgres
+DATABASE_URL=postgresql://user:password@host:6543/postgres?sslmode=require
+DB_POOL_MIN=0
+DB_POOL_MAX=2
+DB_STATEMENT_CACHE_SIZE=0
+```
 
-To add PostgreSQL:
+`DB_STATEMENT_CACHE_SIZE=0` and a small pool are required behind Supabase's
+transaction pooler (port 6543). The connection target is logged without
+credentials.
 
-1. Implement an `AsyncpgDatabase` with the same methods (`execute`, `fetchone`,
-   `fetchall`, `transaction`, `migrate`) using `asyncpg.Pool`.
-2. Convert `?` placeholders to `$1, $2, ...` in one adapter layer.
-3. Translate the baseline DDL: `INTEGER PRIMARY KEY AUTOINCREMENT` → `BIGSERIAL`,
-   `INSERT OR IGNORE` → `INSERT ... ON CONFLICT DO NOTHING`,
-   `MAX(a,b)` → `GREATEST(a,b)`, and ISO text timestamps → `timestamptz`
-   (or keep ISO text for a minimal-change first step).
-4. Add a new numbered migration set for PostgreSQL; never edit migration 1.
-5. Run the full test suite against both backends before deploying.
+### Schema and connection budget
+
+Phase 1 runs against the connection's default `public` schema. A custom
+`search_path` cannot be pinned reliably through a transaction-mode pooler
+(session state is not guaranteed to stay on one backend connection), so the
+application does not expose a `DB_SCHEMA` setting. Custom-schema migration is
+possible only with a direct/session connection (`python -m app.db.migrate
+--schema ...`), which is how the tests isolate themselves; it is not a supported
+runtime configuration yet.
+
+Pool size is a per-process budget:
+
+| Runtime | Processes | Max clients | Notes |
+|---|---|---|---|
+| Vercel webhook (Hobby) | one per warm serverless instance | `DB_POOL_MAX` each | total = concurrent instances × `DB_POOL_MAX`; `DB_POOL_MIN=0` avoids idle clients on cold starts |
+| GitHub Actions worker | exactly one short-lived process | `DB_POOL_MAX` | one bounded pass; `DB_POOL_MIN=0` because the process exits |
+
+With the default `DB_POOL_MAX=2`, ten concurrently warm Vercel instances use at
+most 20 pooler clients, and the Actions worker adds at most 2. Check the actual
+client limit of the Supabase plan before raising these values; the default was
+lowered from 5 because the workloads are short queries, not bulk work.
+
+Transactions are bound to the asyncio task that opened them. A task created
+inside a transaction captures that context even if it is awaited later, after
+the parent transaction has closed. Using the database from such a child task
+raises a clear `RuntimeError` instead of reusing the parent connection or
+deadlocking a small pool. Create database-using child tasks outside the
+transaction, or give them an explicitly clean context (for example
+`asyncio.create_task(coro, context=contextvars.Context())`). A clean context
+only prevents inheritance; the child still needs a free pool slot, so with a
+small pool it must not be awaited to completion while the parent transaction
+holds its connection.
+
+PostgreSQL never migrates implicitly. Apply schema changes deliberately, then
+start the bot:
+
+```powershell
+python -m app.db.migrate --dry-run     # inspect pending migrations
+python -m app.db.migrate               # apply
+```
+
+The runner takes a transaction-level advisory lock (`pg_advisory_xact_lock`),
+records a SHA-256 checksum per applied migration, and refuses to run when an
+applied file changed or an applied version has no file. `--dry-run` writes
+nothing.
+
+`DATABASE_BACKEND=sqlite` (the default) keeps the existing auto-migration on
+connect, so local development and rollback need no extra steps.
+
+SQLite and PostgreSQL execute the same repository SQL. `app/db/sql_dialect.py`
+rewrites the small set of SQLite-only constructs (`?` placeholders,
+`INSERT OR IGNORE`, scalar `MAX`/`MIN`, implicit `rowid`) using a shared
+SQL-aware scanner, so string literals, quoted identifiers and comments are never
+modified. `app/db/migrations_pg/001_baseline.sql` mirrors the SQLite baseline and
+`002_phase2_queue.sql` adds the PostgreSQL-only queue/worker schema. Boolean
+columns stay `SMALLINT` 0/1 and timestamps stay ISO-8601 text for the Phase 1
+tables so behaviour is identical on both backends. Phase 1 adds
+`publishing_runs.insert_seq`, which replaces SQLite's implicit `rowid` for run
+ordering. Only a `rowid` qualified by `publishing_runs` (or one of its aliases)
+is rewritten, plus an unqualified `rowid` when `publishing_runs` is the
+statement's only table; another table's qualified `rowid` is left untouched.
+
+### Phase 2 PostgreSQL queue worker
+
+On PostgreSQL, `/publishnow`, `/resume` and the daily scheduler enqueue durable
+requests instead of publishing inline. `publish_requests`, `publishing_jobs`
+and `publish_request_jobs` coalesce manual/resume work onto an active cycle and
+deduplicate scheduled/catch-up cycles by date and slot. A separate bounded
+worker executes one budgeted pass per invocation:
+
+```powershell
+DATABASE_BACKEND=postgres DATABASE_URL=... python -m app.worker
+```
+
+The worker claims jobs atomically with a 180-second lease and 30-second
+heartbeat, confirms the shared global pacing permit immediately before each
+send, and recovers expired leases with token fencing. Ambiguous network sends
+are recorded as `uncertain` and never blindly resent. Limits per invocation are
+950 total send attempts, a 50-minute work soft deadline, a 52-minute wall soft
+deadline and a 58-minute hard deadline (assuming a 60-minute Actions timeout).
+Billing charges each run with per-run ceiling rounding and reserves a full
+3,600 seconds at admission against a 114,000-second internal monthly cap.
+
+The pacing permit spaces send starts by at least 3.05 seconds. It cannot be
+atomic with the network write: a process suspended after the final ownership and
+local-deadline check can still overlap a replacement worker after its permit
+expires. That residual post-check window is documented in
+`app/services/pacing.py`. SQLite keeps the Phase 1 inline engine unchanged, and
+the Phase 2 worker refuses to run on SQLite except in a dedicated backend-guard
+test.
+
+The parity test compares table/column structure, defaults, named index
+definitions (ordered columns plus ASC/DESC), foreign keys (source column, target
+table/column, `ON DELETE`), primary keys, unique constraints, and canonical
+`CHECK` signatures. Collation, expression/partial indexes, and constraint
+deferrability still require manual review.
+
+Run the PostgreSQL integration tests against any disposable database; each test
+uses and drops its own schema:
+
+```powershell
+$env:TEST_DATABASE_URL = "postgresql://postgres@127.0.0.1:5432/postgres"
+pytest tests/test_pg_adapter.py -q
+```
 
 ## Security notes
 

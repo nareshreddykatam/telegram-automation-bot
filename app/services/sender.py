@@ -30,6 +30,15 @@ class TransientSendError(SendError):
     """Retryable failure: network/server/unknown; cursor must not advance."""
 
 
+class AmbiguousSendError(TransientSendError):
+    """The request may have reached Telegram.
+
+    Phase 2 treats this as ``uncertain`` and never blindly resends. It subclasses
+    ``TransientSendError`` so the legacy SQLite publishing engine keeps its
+    historical retry behaviour.
+    """
+
+
 class PermanentSendError(SendError):
     """Content/chat cannot be copied; record failure and advance cursor."""
 
@@ -74,8 +83,12 @@ class AiogramSender:
             ) from exc
         except TelegramBadRequest as exc:
             raise PermanentSendError(f"Telegram rejected the message: {exc.message}") from exc
-        except (TelegramNetworkError, TelegramServerError) as exc:
-            raise TransientSendError(f"Telegram network/server error: {exc}") from exc
+        except (TelegramNetworkError, TimeoutError) as exc:
+            # The update may have reached Telegram before the connection died or
+            # timed out. Phase 2 records this as uncertain instead of resending.
+            raise AmbiguousSendError(f"Telegram network/timeout error: {exc}") from exc
+        except TelegramServerError as exc:
+            raise TransientSendError(f"Telegram server error: {exc}") from exc
         except Exception as exc:  # Defensive: never silently drop a message.
             logger.exception("Unexpected Telegram copy error")
             raise TransientSendError(f"Unexpected copy error: {exc}") from exc
@@ -98,8 +111,10 @@ class AiogramSender:
             ) from exc
         except TelegramBadRequest as exc:
             raise PermanentSendError(f"Telegram rejected the album: {exc.message}") from exc
-        except (TelegramNetworkError, TelegramServerError) as exc:
-            raise TransientSendError(f"Telegram network/server error: {exc}") from exc
+        except (TelegramNetworkError, TimeoutError) as exc:
+            raise AmbiguousSendError(f"Telegram network/timeout error: {exc}") from exc
+        except TelegramServerError as exc:
+            raise TransientSendError(f"Telegram server error: {exc}") from exc
         except Exception as exc:
             logger.exception("Unexpected Telegram album copy error")
             raise TransientSendError(f"Unexpected album copy error: {exc}") from exc

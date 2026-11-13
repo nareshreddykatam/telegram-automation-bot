@@ -25,6 +25,22 @@ class RecoveryService:
         self._db = db
 
     async def recover(self) -> RecoveryReport:
+        if self._db.backend == "postgres":
+            # Phase 2 publishing is owned by a separate bounded worker. Its
+            # leases are recovered by ``app.worker``; the global Phase 1 sweep
+            # below would mark an *active* worker's ``sending`` rows uncertain
+            # (and advance their cursors) merely because the bot process
+            # restarted at the same time.
+            logger.info(
+                "Startup recovery skipped: PostgreSQL publishing uses "
+                "lease-scoped worker recovery"
+            )
+            return RecoveryReport(
+                uncertain_messages=0,
+                aborted_runs=0,
+                affected_destinations=0,
+                reset_scheduled_runs=0,
+            )
         summary = await publishing_repo.recover_interrupted(self._db)
         reset = await scheduler_repo.reset_running_scheduled_runs(self._db)
         report = RecoveryReport(

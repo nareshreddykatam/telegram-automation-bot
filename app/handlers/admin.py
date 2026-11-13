@@ -23,6 +23,7 @@ from app.scheduler.scheduler import PublishingScheduler
 from app.services.background import BackgroundTasks
 from app.services.join_requests import JoinRequestService
 from app.services.publishing import PublishingService
+from app.services.queue_requests import QueueRequestService
 from app.services.reports import ReportService
 from app.utils.errors import CommandError
 from app.utils.time import format_local, local_now
@@ -265,6 +266,19 @@ async def cmd_resume(
         destination = await _find_destination(db, bot, command.args.split()[0])
         await destinations_repo.set_paused(db, destination.chat_id, False)
 
+        if db.backend == "postgres":
+            creation = await QueueRequestService(db).create_manual_request(
+                request_type="resume",
+                requested_by=int(message.from_user.id) if message.from_user else None,
+                destination_id=destination.id,
+            )
+            await message.answer(
+                f"Resumed {_chat_label(destination.chat_id, destination.title)}. "
+                f"Resume publishing queued for {len(creation.job_ids)} destination(s); "
+                "the PostgreSQL worker will publish it."
+            )
+            return
+
         async def _resume_destination() -> None:
             result = await publishing.publish_destination(destination.id, trigger="resume")
             await reports.send_to_owners(reports.format_run_report(result))
@@ -423,6 +437,22 @@ async def cmd_publishnow(
         raise CommandError("No active destinations are available.")
 
     schedule_date = local_now(settings.tzinfo).date().isoformat()
+
+    if db.backend == "postgres":
+        creation = await QueueRequestService(db).create_manual_request(
+            request_type="manual",
+            requested_by=int(message.from_user.id) if message.from_user else None,
+            destination_id=destination_ids[0] if command.args else None,
+        )
+        if creation.cancelled:
+            await message.answer("No active destinations are available for a new cycle.")
+            return
+        await message.answer(
+            f"Manual publishing queued for {len(creation.job_ids)} destination(s). "
+            f"{len(creation.coalesced_job_ids)} already had an active cycle; "
+            "the PostgreSQL worker will publish it."
+        )
+        return
 
     async def _run() -> None:
         results = []

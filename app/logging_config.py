@@ -34,16 +34,23 @@ def setup_logging(settings: Settings) -> None:
 
     if settings.log_file is not None:
         path = Path(settings.log_file)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.handlers.RotatingFileHandler(
-            path,
-            maxBytes=5 * 1024 * 1024,
-            backupCount=5,
-            encoding="utf-8",
-        )
-        file_handler.setFormatter(formatter)
-        file_handler.setLevel(level)
-        root.addHandler(file_handler)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = logging.handlers.RotatingFileHandler(
+                path,
+                maxBytes=5 * 1024 * 1024,
+                backupCount=5,
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            # Serverless runtimes such as Vercel have a read-only project
+            # filesystem. Console logging must still work instead of aborting
+            # application startup.
+            root.warning("File logging disabled for %s: %s", path, exc)
+        else:
+            file_handler.setFormatter(formatter)
+            file_handler.setLevel(level)
+            root.addHandler(file_handler)
 
     # aiogram's per-update debug log is very noisy at INFO.
     logging.getLogger("aiogram.event").setLevel(logging.WARNING)

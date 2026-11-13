@@ -16,6 +16,7 @@ from app.db.models import RunResult
 from app.db.repositories import destinations as destinations_repo
 from app.db.repositories import scheduler as scheduler_repo
 from app.services.publishing import PublishingService
+from app.services.queue_requests import QueueRequestService
 from app.services.reports import ReportService
 from app.utils.time import format_local, local_now, scheduled_target_date
 
@@ -89,6 +90,9 @@ class PublishingScheduler:
             )
             return []
 
+        if self._db.backend == "postgres":
+            return await self._enqueue_cycle(schedule_date, trigger)
+
         async with self._cycle_lock:
             logger.info("Starting publishing cycle date=%s trigger=%s", schedule_date, trigger)
             destinations = await destinations_repo.list_destinations(self._db, enabled_only=True)
@@ -140,6 +144,33 @@ class PublishingScheduler:
                 all_success,
             )
             return results
+
+    async def _enqueue_cycle(self, schedule_date: str, trigger: str) -> list[RunResult]:
+        """Queue a scheduled/catch-up cycle for the Phase 2 worker.
+
+        The inline Phase 1 engine is deliberately skipped on PostgreSQL: the
+        handler-facing bot process must not send while the worker owns publishing.
+        """
+
+        request_type = trigger if trigger in {"schedule", "catchup"} else "schedule"
+        creation = await QueueRequestService(self._db).create_scheduled_request(
+            request_type=request_type,
+            schedule_date=schedule_date,
+            slot="daily",
+        )
+        if creation.cancelled:
+            message = f"Scheduled cycle {schedule_date} had no eligible destinations."
+        elif creation.skipped:
+            message = f"Scheduled cycle {schedule_date} is already queued or complete."
+        else:
+            message = (
+                f"Scheduled cycle {schedule_date} queued "
+                f"({len(creation.job_ids)} destination job(s))."
+            )
+            await scheduler_repo.set_last_cycle_date(self._db, schedule_date)
+        logger.info(message)
+        await self._reports.send_to_owners(message)
+        return []
 
     async def catch_up_if_needed(self, trigger: str = "catchup") -> list[RunResult]:
         if not self._settings.catchup_on_startup and trigger == "startup":

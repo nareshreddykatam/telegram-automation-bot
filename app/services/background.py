@@ -39,6 +39,28 @@ class BackgroundTasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def wait(self, timeout: float = 10.0) -> None:
+        """Wait for spawned tasks instead of cancelling them.
+
+        Serverless request handlers must let short follow-up work (for example a
+        PostgreSQL catch-up enqueue) finish before the function instance is
+        frozen. Long publishing work is still bounded by ``timeout`` and is
+        cancelled rather than silently abandoning the request.
+        """
+
+        if not self._tasks:
+            return
+        tasks = list(self._tasks)
+        _, pending = await asyncio.wait(tasks, timeout=timeout)
+        if not pending:
+            return
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        logger.warning(
+            "Background task timeout (%ss): cancelled %s task(s)", timeout, len(pending)
+        )
+
     @property
     def active_count(self) -> int:
         return len(self._tasks)

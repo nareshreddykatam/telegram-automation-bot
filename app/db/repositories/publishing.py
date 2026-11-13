@@ -10,6 +10,7 @@ while still surfacing the uncertain message in reports and /history.
 
 from __future__ import annotations
 
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -62,25 +63,44 @@ async def finish_run(
     uncertain_count: int,
     skipped_count: int,
     error: str | None = None,
-) -> None:
-    await db.execute(
-        """
+    job_id: str | None = None,
+    lease_token: uuid.UUID | None = None,
+) -> bool:
+    """Finish a run, optionally fenced by the owning job's lease token.
+
+    The Phase 2 worker passes its job id and lease token. A worker that lost
+    its lease must not overwrite the run state that lease recovery already
+    finalised, so the update only applies while that exact job still owns the
+    run. SQLite/Phase 1 callers pass neither and keep the historical UPDATE.
+    """
+
+    sql = """
         UPDATE publishing_runs SET
             status = ?, success_count = ?, failed_count = ?, uncertain_count = ?,
             skipped_count = ?, finished_at = ?, error = ?
         WHERE id = ?
-        """,
-        (
-            status,
-            success_count,
-            failed_count,
-            uncertain_count,
-            skipped_count,
-            utc_now_iso(),
-            _short(error),
-            run_id,
-        ),
-    )
+        """
+    params: list[object] = [
+        status,
+        success_count,
+        failed_count,
+        uncertain_count,
+        skipped_count,
+        utc_now_iso(),
+        _short(error),
+        run_id,
+    ]
+    if job_id is not None and lease_token is not None:
+        sql += (
+            " AND EXISTS ("
+            " SELECT 1 FROM publishing_jobs"
+            " WHERE id = ? AND run_id = ? AND status = 'running'"
+            " AND lease_token = ?"
+            ")"
+        )
+        params.extend((job_id, run_id, lease_token))
+    cursor = await db.execute(sql, tuple(params))
+    return cursor.rowcount > 0
 
 
 async def get_run(db: Database, run_id: str) -> PublishingRun | None:

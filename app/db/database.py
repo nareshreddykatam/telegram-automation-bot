@@ -22,12 +22,20 @@ logger = logging.getLogger(__name__)
 
 
 class Database:
+    """SQLite backend (default for local development and rollback)."""
+
+    backend = "sqlite"
+
     def __init__(self, path: str | Path, busy_timeout_ms: int = 5000) -> None:
         self.path = str(path)
         self.busy_timeout_ms = busy_timeout_ms
         self._conn: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
         self._tx_active: ContextVar[bool] = ContextVar(f"db_tx_active_{id(self)}", default=False)
+
+    @property
+    def label(self) -> str:
+        return self.path
 
     @property
     def connection(self) -> aiosqlite.Connection:
@@ -51,6 +59,9 @@ class Database:
         await self.execute("PRAGMA synchronous = NORMAL")
         if self.path != ":memory:":
             await self.execute("PRAGMA journal_mode = WAL")
+        # SQLite keeps its historical auto-migration on connect: it is a local
+        # file database and this path is also the rollback target. The
+        # PostgreSQL backend never migrates implicitly.
         await self.migrate()
 
     async def close(self) -> None:

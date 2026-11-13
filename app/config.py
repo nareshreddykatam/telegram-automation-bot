@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -39,6 +40,15 @@ def _env_float(name: str, default: float, minimum: float, maximum: float) -> flo
     if not minimum <= value <= maximum:
         raise ConfigError(f"{name} must be between {minimum} and {maximum}, got {value}")
     return value
+
+
+def _env_optional(name: str) -> str | None:
+    """Return a stripped value, treating empty strings as unset."""
+
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return None
+    return value.strip()
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -80,6 +90,15 @@ class Settings:
     bot_token: str = field(repr=False)
     owner_ids: tuple[int, ...]
     database_path: Path = Path("data/bot.db")
+    database_backend: str = "sqlite"
+    database_url: str | None = field(default=None, repr=False)
+    telegram_webhook_secret: str | None = field(default=None, repr=False)
+    db_pool_min: int = 0
+    db_pool_max: int = 2
+    db_ssl: str = "require"
+    db_statement_cache_size: int = 0
+    db_command_timeout_seconds: float = 30.0
+    db_connect_timeout_seconds: float = 10.0
     timezone: str = "Asia/Kolkata"
     publish_hour: int = 20
     publish_minute: int = 0
@@ -102,6 +121,29 @@ class Settings:
             raise ConfigError("BOT_TOKEN is required")
         if not self.owner_ids:
             raise ConfigError("OWNER_IDS is required")
+        if self.database_backend not in {"sqlite", "postgres"}:
+            raise ConfigError(
+                f"DATABASE_BACKEND must be 'sqlite' or 'postgres', got {self.database_backend!r}"
+            )
+        if self.database_backend == "postgres":
+            if not self.database_url:
+                raise ConfigError("DATABASE_URL is required when DATABASE_BACKEND=postgres")
+            if not self.database_url.startswith(("postgres://", "postgresql://")):
+                raise ConfigError(
+                    "DATABASE_URL must start with postgres:// or postgresql://"
+                )
+        if self.telegram_webhook_secret is not None:
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", self.telegram_webhook_secret):
+                raise ConfigError(
+                    "TELEGRAM_WEBHOOK_SECRET must be 1-256 characters from "
+                    "A-Z, a-z, 0-9, underscore or hyphen"
+                )
+        if self.db_pool_min < 0 or self.db_pool_max < 1 or self.db_pool_max < self.db_pool_min:
+            raise ConfigError(
+                "DB_POOL_MIN must be >= 0 and DB_POOL_MAX must be >= max(1, DB_POOL_MIN)"
+            )
+        if self.db_statement_cache_size < 0:
+            raise ConfigError("DB_STATEMENT_CACHE_SIZE must be >= 0")
         if not 0 <= self.publish_hour <= 23:
             raise ConfigError("PUBLISH_HOUR must be between 0 and 23")
         if not 0 <= self.publish_minute <= 59:
@@ -125,7 +167,9 @@ class Settings:
     def from_env(cls, env_file: str | Path = ".env") -> Settings:
         # override=False keeps real environment variables authoritative.
         load_dotenv(dotenv_path=env_file, override=False)
-        token = _env("BOT_TOKEN", "")
+        # BOT_TOKEN is the original name. TELEGRAM_BOT_TOKEN is accepted as an
+        # alias for hosting dashboards that use the more explicit name.
+        token = _env_optional("BOT_TOKEN") or _env_optional("TELEGRAM_BOT_TOKEN") or ""
         if not token:
             raise ConfigError("BOT_TOKEN is required")
         log_file_raw = os.getenv("LOG_FILE")
@@ -136,9 +180,22 @@ class Settings:
         else:
             log_file = Path(log_file_raw.strip()).expanduser()
         return cls(
-            bot_token=_env("BOT_TOKEN", ""),
+            bot_token=token,
             owner_ids=_parse_owner_ids(_env("OWNER_IDS", "")),
             database_path=Path(_env("DATABASE_PATH", "data/bot.db")).expanduser(),
+            database_backend=_env("DATABASE_BACKEND", "sqlite").lower(),
+            database_url=_env_optional("DATABASE_URL"),
+            telegram_webhook_secret=_env_optional("TELEGRAM_WEBHOOK_SECRET"),
+            db_pool_min=_env_int("DB_POOL_MIN", 0, 0, 50),
+            db_pool_max=_env_int("DB_POOL_MAX", 2, 1, 50),
+            db_ssl=_env("DB_SSL", "require").lower(),
+            db_statement_cache_size=_env_int("DB_STATEMENT_CACHE_SIZE", 0, 0, 10_000),
+            db_command_timeout_seconds=_env_float(
+                "DB_COMMAND_TIMEOUT_SECONDS", 30.0, 1.0, 3600.0
+            ),
+            db_connect_timeout_seconds=_env_float(
+                "DB_CONNECT_TIMEOUT_SECONDS", 10.0, 1.0, 300.0
+            ),
             timezone=_env("TIMEZONE", "Asia/Kolkata"),
             publish_hour=_env_int("PUBLISH_HOUR", 20, 0, 23),
             publish_minute=_env_int("PUBLISH_MINUTE", 0, 0, 59),

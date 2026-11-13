@@ -30,3 +30,13 @@ async def db(settings: Settings):
         yield database
     finally:
         await database.close()
+
+
+@pytest_asyncio.fixture
+async def pg_db():
+    """PostgreSQL backend in a disposable schema; skipped without TEST_DATABASE_URL."""
+
+    from tests.pg_utils import pg_database
+
+    async with pg_database() as (database, _schema):
+        yield database
